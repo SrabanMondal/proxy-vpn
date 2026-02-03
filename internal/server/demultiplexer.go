@@ -130,7 +130,7 @@ func (d *Demultiplexer) runTCPRelay(sess *session.SessionContext, sessionID uint
     var seqID uint32
     defer func() {
         buf := pool.Get()
-        finPkt := protocol.NewPacket(sessionID, header.TYPE_FIN, 0, buf[11:1460], buf)
+        finPkt := protocol.NewPacket(sessionID, header.TYPE_FIN, seqID, buf[11:1460], buf)
         work, err := d.Builder.Build(finPkt)
         if err == nil {
             select{
