@@ -1,0 +1,64 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Go build artifacts
+bin/
+build/
+dist/
+
+# Go workspace
+go.work
+go.work.sum
+
+# Dependency directories (if any)
+vendor/
+
+# Test results
+*.prof
+
+# Logs and temp files
+*.log
+*.tmp
+*.cache
+*.swp
+
+# IDE / Editor settings
+
+# VS Code
+.vscode/
+*.code-workspace
+
+# Goland / IntelliJ
+.idea/
+
+# Sublime
+*.sublime-project
+*.sublime-workspace
+
+# macOS
+.DS_Store
+
+# Linux
+*~
+
+# Windows
+Thumbs.db
+Desktop.ini
+
+# Env files (optional but recommended)
+.env
+.env.*
+!.env.example
+
+# Modules cache (optional; usually not needed)
+# $GOMODCACHE
+
+# Generated docs or assets
+docs/generated/
+assets/generated/
