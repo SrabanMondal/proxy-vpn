@@ -5,6 +5,8 @@ import (
 	"log"
 	"net"
 	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/SrabanMondal/proxy-vpn/internal/protocol"
 	"github.com/SrabanMondal/proxy-vpn/internal/protocol/codec"
@@ -65,6 +67,14 @@ func main() {
 	demux := server.NewDemultiplexer(udpConn, registry, parser, mux, builder)
 	demux.Start()
 
-	log.Println("VPN server listening on UDP :",SERVER_PORT)
-	select {}
+	log.Println("VPN server listening on UDP :", SERVER_PORT)
+
+	// Block until shutdown signal
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
+
+	log.Println("shutting down server...")
+	demux.Close()
+	mux.Stop()
 }

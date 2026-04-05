@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/SrabanMondal/proxy-vpn/internal/pool"
@@ -15,11 +16,13 @@ import (
 )
 
 type Demultiplexer struct {
-	UDPConn  *net.UDPConn
-	Registry *session.Registry
-	Parser   *protocol.Parser
-	Builder  *protocol.Builder      
+	UDPConn     *net.UDPConn
+	Registry    *session.Registry
+	Parser      *protocol.Parser
+	Builder     *protocol.Builder
 	Multiplexer *Multiplexer
+	done        chan struct{}
+	wg          sync.WaitGroup
 }
 
 func NewDemultiplexer(conn *net.UDPConn, registry *session.Registry, parser *protocol.Parser, multiplexer *Multiplexer, builder *protocol.Builder) *Demultiplexer {
@@ -28,23 +31,37 @@ func NewDemultiplexer(conn *net.UDPConn, registry *session.Registry, parser *pro
 		Registry:    registry,
 		Parser:      parser,
 		Multiplexer: multiplexer,
-		Builder: builder,
+		Builder:     builder,
+		done:        make(chan struct{}),
 	}
 }
 
 func (d *Demultiplexer) Start() {
-    go func() {
-        for {
-            buf := pool.Get()
-            n, clientAddr, err := d.UDPConn.ReadFromUDP(buf)
-            if err != nil {
-                pool.Put(buf)
-                continue
-            }
+	d.wg.Add(1)
+	go func() {
+		defer d.wg.Done()
+		for {
+			buf := pool.Get()
+			n, clientAddr, err := d.UDPConn.ReadFromUDP(buf)
+			if err != nil {
+				pool.Put(buf)
+				select {
+				case <-d.done:
+					return
+				default:
+					continue
+				}
+			}
 
-            d.handlePacket(buf, n, clientAddr)
-        }
-    }()
+			d.handlePacket(buf, n, clientAddr)
+		}
+	}()
+}
+
+func (d *Demultiplexer) Close() {
+	close(d.done)
+	d.UDPConn.Close()
+	d.wg.Wait()
 }
 
 func (d *Demultiplexer) handlePacket(buf []byte, n int, clientAddr *net.UDPAddr) {
@@ -134,8 +151,7 @@ func (d *Demultiplexer) runTCPRelay(sess *session.SessionContext, sessionID uint
         work, err := d.Builder.Build(finPkt)
         if err == nil {
             select{
-                case 
-                d.Multiplexer.SendChan <- OutboundPacket{
+                case d.Multiplexer.SendChan <- OutboundPacket{
                     Data:   work.Data,
                     Addr:   sess.ClientAddr,
                     Buffer: buf,

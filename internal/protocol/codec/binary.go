@@ -40,7 +40,12 @@ func (c *BinaryCodec) Decode(b []byte) (*header.Header, []byte, error) {
         Length:    binary.BigEndian.Uint16(b[9:11]),
     }
 
-    payload := b[header.HeaderSize : header.HeaderSize+int(h.Length)]
+    payloadEnd := header.HeaderSize + int(h.Length)
+    if payloadEnd > len(b) {
+        return nil, nil, errors.New("payload length exceeds buffer size")
+    }
+
+    payload := b[header.HeaderSize:payloadEnd]
 
     return h, payload, nil
 }
