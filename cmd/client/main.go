@@ -5,6 +5,8 @@ import (
 	"log"
 	"net"
 	"os"
+	"strconv"
+	"time"
 
 	"github.com/SrabanMondal/proxy-vpn/internal/client"
 	"github.com/SrabanMondal/proxy-vpn/internal/protocol"
@@ -25,7 +27,7 @@ func main() {
 	CRYPTO := os.Getenv("CRYPTO")
 	HEX_KEY := os.Getenv("KEY")
 	CLIENT_ADDR := os.Getenv("CLIENT_ADDR")
-
+	idleTimeout := parseIdleTimeout(os.Getenv("IDLE_TIMEOUT_SECONDS"), 120)
 
 	serverAddr := SERVER_ADDR
 	udpConn, err := net.Dial("udp", serverAddr)
@@ -35,7 +37,7 @@ func main() {
 
 	registry := session.NewRegistry()
 	err = codec.SetCodec(CODEC)
-	if err!=nil {
+	if err != nil {
 		panic(err)
 	}
 
@@ -44,7 +46,7 @@ func main() {
 		panic(err)
 	}
 	err = crypto.SetCrypto(CRYPTO, key)
-	if err!=nil{
+	if err != nil {
 		panic(err)
 	}
 
@@ -61,9 +63,9 @@ func main() {
 
 	listener, err := net.Listen("tcp", CLIENT_ADDR)
 	if err != nil {
-		log.Fatal("failed to listen on ", CLIENT_ADDR," : ", err)
+		log.Fatal("failed to listen on ", CLIENT_ADDR, " : ", err)
 	}
-	log.Println("SOCKS5 proxy listening on ",CLIENT_ADDR)
+	log.Println("SOCKS5 proxy listening on ", CLIENT_ADDR)
 
 	for {
 		conn, err := listener.Accept()
@@ -71,6 +73,19 @@ func main() {
 			log.Println("accept error:", err)
 			continue
 		}
-		go client.HandleBrowserSession(conn, registry, mux, builder)
+		go client.HandleBrowserSession(conn, registry, mux, builder, idleTimeout)
 	}
+}
+
+func parseIdleTimeout(raw string, defaultSeconds int) time.Duration {
+	if raw == "" {
+		return time.Duration(defaultSeconds) * time.Second
+	}
+
+	v, err := strconv.Atoi(raw)
+	if err != nil || v <= 0 {
+		return time.Duration(defaultSeconds) * time.Second
+	}
+
+	return time.Duration(v) * time.Second
 }

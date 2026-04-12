@@ -5,23 +5,24 @@ import (
 	"log"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/SrabanMondal/proxy-vpn/internal/pool"
 )
 
 type OutboundPacket struct {
-	Data   []byte      
-	Buffer []byte       
+	Data   []byte
+	Buffer []byte
 	Addr   *net.UDPAddr
 }
 
 type Multiplexer struct {
-	SendChan chan OutboundPacket
-	UDPConn  *net.UDPConn
-	wg       sync.WaitGroup
-	quit     chan struct{}
-	stopOnce   sync.Once
-    closeChan  sync.Once
+	SendChan  chan OutboundPacket
+	UDPConn   *net.UDPConn
+	wg        sync.WaitGroup
+	quit      chan struct{}
+	stopOnce  sync.Once
+	closeChan sync.Once
 }
 
 func NewMultiplexer(conn *net.UDPConn, queueSize int) *Multiplexer {
@@ -40,7 +41,7 @@ func (m *Multiplexer) Start() {
 			select {
 			case pkt, ok := <-m.SendChan:
 				if !ok {
-					return 
+					return
 				}
 
 				log.Printf("[SERVER-MUX] Sending encrypted data len=%d", len(pkt.Data))
@@ -62,19 +63,38 @@ func (m *Multiplexer) Start() {
 	}()
 }
 
-// func (m *Multiplexer) Stop() {
-// 	close(m.quit)
-// 	close(m.SendChan)
-// 	m.wg.Wait()
-// }
+//	func (m *Multiplexer) Stop() {
+//		close(m.quit)
+//		close(m.SendChan)
+//		m.wg.Wait()
+//	}
 func (m *Multiplexer) Stop() {
-    m.stopOnce.Do(func() {
-        close(m.quit)
+	m.stopOnce.Do(func() {
+		close(m.quit)
 
-        m.closeChan.Do(func() {
-            close(m.SendChan)
-        })
+		m.closeChan.Do(func() {
+			close(m.SendChan)
+		})
 
-        m.wg.Wait()
-    })
+		m.wg.Wait()
+	})
+}
+
+// Send enqueues a packet with timeout to avoid indefinite blocking under backpressure.
+func (m *Multiplexer) Send(pkt OutboundPacket, timeout time.Duration) bool {
+	if timeout <= 0 {
+		timeout = 2 * time.Second
+	}
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	select {
+	case m.SendChan <- pkt:
+		return true
+	case <-timer.C:
+		return false
+	case <-m.quit:
+		return false
+	}
 }

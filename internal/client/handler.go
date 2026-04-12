@@ -18,8 +18,12 @@ func HandleBrowserSession(
 	registry *session.Registry,
 	multiplexer *Multiplexer,
 	builder *protocol.Builder,
+	idleTimeout time.Duration,
 ) {
 	defer browserConn.Close()
+	if idleTimeout <= 0 {
+		idleTimeout = 120 * time.Second
+	}
 
 	// 1. SOCKS5 handshake
 	targetAddr, err := PerformSOCKS5Handshake(browserConn)
@@ -32,8 +36,7 @@ func HandleBrowserSession(
 		log.Printf("[SERVER] Invalid target address from CONNECT packet: %q, error: %v", targetAddr, err)
 		return
 	}
-	log.Printf("[SOCKS5] IP address: %s Port: %s", host,port)
-	
+	log.Printf("[SOCKS5] IP address: %s Port: %s", host, port)
 
 	// 2. Generate session ID
 	sessID := GenerateSessionID()
@@ -42,8 +45,8 @@ func HandleBrowserSession(
 	sess := session.NewSession(browserConn)
 	registry.Add(sessID, sess)
 	defer func() {
-		sess.Close()
 		registry.Delete(sessID)
+		sess.Close()
 	}()
 
 	// 5. Send CONNECT packet to server
@@ -58,32 +61,32 @@ func HandleBrowserSession(
 		log.Println("failed to build CONNECT packet:", err)
 		return
 	}
-	multiplexer.SendChan <- data
+	if !sendOutboundWithTimeout(multiplexer, data, 2*time.Second) {
+		log.Printf("[session %d] failed to enqueue CONNECT packet", sessID)
+		return
+	}
 
 	// 6. Forward Browser -> UDP (server)
 	var localSeqID uint32
 	for {
 		buf := pool.Get()
-		browserConn.SetReadDeadline(time.Now().Add(30 * time.Second))
-		n, err := browserConn.Read(buf[11:1460])
+		browserConn.SetReadDeadline(time.Now().Add(idleTimeout))
+		n, err := browserConn.Read(buf[header.HeaderSize:1460])
 		//log.Printf("Received Paylod from browser: %q",buf[11:11+n])
 		if err != nil {
 			if ne, ok := err.(net.Error); ok && ne.Timeout() {
-                log.Printf("[session %d] idle timeout, closing", sessID)
-            }
+				log.Printf("[session %d] idle timeout, closing", sessID)
+			}
 			if err != io.EOF {
 				log.Println("browser read error:", err)
 			}
 			pool.Put(buf)
-			empty := pool.Get()
-			finPkt := protocol.NewPacket(sessID, header.TYPE_FIN, 0, empty[11:1460], empty)
-			data, _ := builder.Build(finPkt)
-			multiplexer.SendChan <- data
+			sendFINWithRetry(sessID, builder, multiplexer)
 			return
 		}
 
 		// Build DATA packet
-		pkt := protocol.NewPacket(sessID, header.TYPE_DATA, localSeqID, buf[11:11+n], buf)
+		pkt := protocol.NewPacket(sessID, header.TYPE_DATA, localSeqID, buf[header.HeaderSize:header.HeaderSize+n], buf)
 		localSeqID++
 		data, err := builder.Build(pkt)
 		if err != nil {
@@ -91,7 +94,40 @@ func HandleBrowserSession(
 			pool.Put(buf)
 			continue
 		}
-		multiplexer.SendChan <- data;
+		if !sendOutboundWithTimeout(multiplexer, data, 2*time.Second) {
+			log.Printf("[session %d] send queue timeout, closing session", sessID)
+			sendFINWithRetry(sessID, builder, multiplexer)
+			return
+		}
 
 	}
+}
+
+func sendOutboundWithTimeout(multiplexer *Multiplexer, data protocol.OutboundWork, timeout time.Duration) bool {
+	if multiplexer.Send(data, timeout) {
+		return true
+	}
+
+	if data.OriginalBuffer != nil {
+		pool.Put(data.OriginalBuffer)
+	}
+	return false
+}
+
+func sendFINWithRetry(sessionID uint32, builder *protocol.Builder, multiplexer *Multiplexer) {
+	for i := 0; i < 3; i++ {
+		buf := pool.Get()
+		finPkt := protocol.NewPacket(sessionID, header.TYPE_FIN, 0, buf[header.HeaderSize:header.HeaderSize], buf)
+		data, err := builder.Build(finPkt)
+		if err != nil {
+			pool.Put(buf)
+			continue
+		}
+
+		if sendOutboundWithTimeout(multiplexer, data, 500*time.Millisecond) {
+			return
+		}
+	}
+
+	log.Printf("[session %d] failed to deliver FIN after retries", sessionID)
 }

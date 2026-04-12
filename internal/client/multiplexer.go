@@ -4,6 +4,7 @@ import (
 	"log"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/SrabanMondal/proxy-vpn/internal/pool"
 	"github.com/SrabanMondal/proxy-vpn/internal/protocol"
@@ -11,8 +12,8 @@ import (
 
 // Multiplexer manages the global outbound UDP queue.
 type Multiplexer struct {
-	SendChan chan protocol.OutboundWork     // channel for all outbound packets from client
-	UDPConn  *net.UDPConn     // vps server connection
+	SendChan chan protocol.OutboundWork // channel for all outbound packets from client
+	UDPConn  *net.UDPConn               // vps server connection
 	wg       sync.WaitGroup
 	quit     chan bool
 }
@@ -36,7 +37,7 @@ func (m *Multiplexer) Start() {
 			case work := <-m.SendChan:
 				if m.UDPConn != nil {
 					_, err := m.UDPConn.Write(work.Data)
-					if err!=nil{
+					if err != nil {
 						log.Println("client multiplexer write error:", err)
 					}
 				}
@@ -55,4 +56,21 @@ func (m *Multiplexer) Stop() {
 	default:
 	}
 	m.wg.Wait()
+}
+
+// Send enqueues an outbound packet with timeout to prevent indefinite blocking.
+func (m *Multiplexer) Send(work protocol.OutboundWork, timeout time.Duration) bool {
+	if timeout <= 0 {
+		timeout = 2 * time.Second
+	}
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	select {
+	case m.SendChan <- work:
+		return true
+	case <-timer.C:
+		return false
+	}
 }
