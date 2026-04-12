@@ -108,7 +108,7 @@ Decrypted payload structure:
 - Better NAT traversal characteristics
 - Mimics legitimate UDP traffic patterns (VoIP, gaming)
 
-**Trade-off**: Required implementing custom reliability layer (seq-based reordering) within the application.
+**Trade-off**: Required implementing an application-level ordering layer (sequence-based reordering) over UDP.
 
 ### XChaCha20-Poly1305 vs AES-GCM
 
@@ -143,23 +143,25 @@ binary.BigEndian.PutUint16(buf[9:11], h.Length)
 
 ### Sliding Window Reordering
 
-**Choice**: Per-session sequence-based window instead of strict ordering.
+**Choice**: Per-session sequence-based window with strict in-order delivery.
 
 ```go
 // internal/session/session.go
 func (s *SessionContext) InsertPacket(seqID uint32, payload []byte, originalBuffer []byte) {
-    s.Window[seqID] = item{payload, originalBuffer}
+    if seqID < s.NextSeqID {
+        // Drop late/duplicate packet
+        return
+    }
+    s.Window[seqID] = item{payload: payload, original: originalBuffer}
     s.Signal <- struct{}{}
 }
 ```
 
 **Trade-off**:
 
-- ✅ Out-of-order delivery support
-- ✅ Graceful handling of packet loss (timeout-based advancement)
-- ❌ No retransmission—relies on underlying reliability when needed
-
-The 50ms ticker advances `NextSeqID` on timeout, accepting some packet loss for lower latency.
+- ✅ Out-of-order arrival is buffered
+- ✅ TCP byte-stream correctness is preserved (no sequence skipping)
+- ❌ No retransmission (missing packets cause head-of-line blocking until they arrive)
 
 ### Single UDP Socket Multiplexing
 
@@ -223,13 +225,10 @@ type SessionContext struct {
 
 ```go
 func (s *SessionContext) runFlusher() {
-    ticker := time.NewTicker(50 * time.Millisecond)
     for {
         select {
         case <-s.Signal:
-            s.flush()  // Immediate flush on packet insert
-        case <-ticker.C:
-            s.handleTimeout()  // Advance window on timeout
+            s.flush()  // Flush only contiguous seq: NextSeqID, NextSeqID+1, ...
         case <-s.Quit:
             return
         }
@@ -311,7 +310,7 @@ func (d *Demultiplexer) handlePacket(buf []byte, n int, clientAddr *net.UDPAddr)
     case TYPE_DATA:
         if ok { sess.InsertPacket(seqID, payload, buf) }
     case TYPE_FIN:
-        if ok { sess.Close(); d.Registry.Delete(sessionID) }
+        if ok { d.Registry.Delete(sessionID); sess.Close() }
     }
 }
 ```
@@ -354,35 +353,28 @@ func (tb *TokenBucket) Wait(tokensToConsume int) {
 
 ### Error Handling Matrix
 
-| Failure              | Detection                      | Recovery                      |
-| -------------------- | ------------------------------ | ----------------------------- |
-| Packet corruption    | Poly1305 auth tag verification | Drop packet, return to pool   |
-| Out-of-order arrival | SeqID mismatch in window       | Buffer until flush or timeout |
-| Session timeout      | 30s read deadline              | Send FIN, cleanup             |
-| UDP write failure    | Error from `WriteToUDP`        | Log, continue (best-effort)   |
-| Crypto init failure  | Key length validation          | `panic()` at startup          |
+| Failure              | Detection                                 | Recovery                         |
+| -------------------- | ----------------------------------------- | -------------------------------- |
+| Packet corruption    | Poly1305 auth tag verification            | Drop packet, return to pool      |
+| Out-of-order arrival | SeqID gap in window                       | Buffer until missing seq arrives |
+| Session timeout      | Configurable idle deadline (default 120s) | Send FIN, cleanup                |
+| UDP write failure    | Error from `WriteToUDP`                   | Log, continue (best-effort)      |
+| Crypto init failure  | Key length validation                     | `panic()` at startup             |
 
 ### Resource Leak Prevention
 
 ```go
 defer func() {
-    sess.Close()
     registry.Delete(sessID)
+    sess.Close()
 }()
 ```
 
-All handlers use deferred cleanup. `SessionContext.Close()` uses `sync.Once` semantics via channel close detection:
+All handlers use deferred cleanup. Session close is guarded and idempotent, and buffered packets are returned to the pool:
 
 ```go
 func (s *SessionContext) Close() {
-    select {
-    case <-s.Quit:
-        return  // Already closed
-    default:
-        close(s.Quit)
-        s.TargetConn.Close()
-        // Return all buffered payloads to pool
-    }
+    // Mark closed once, close conn, and release queued buffers safely.
 }
 ```
 
@@ -439,15 +431,17 @@ KEY="32 bit hex string"  # 64 hex chars = 32 bytes
 
 ### Complexity Analysis
 
-| Operation      | Time             | Space            |
+| Operation      | Time Complexity  | Space Complexity |
 | -------------- | ---------------- | ---------------- |
-| Packet encode  | O(1)             | O(1) - in-place  |
-| Packet decrypt | O(n)             | O(1) - in-place  |
+| Packet encode  | O(1)             | O(1) (in-place)  |
+| Packet decrypt | O(n)             | O(1) (in-place)  |
 | Session lookup | O(1) avg         | O(n) sessions    |
 | Window insert  | O(1)             | O(w) window size |
 | Window flush   | O(k) consecutive | O(1) per item    |
 
-### Zero-Allocation Path
+---
+
+### Zero-Allocation Data Path
 
 ```go
 var bytePool = sync.Pool{
@@ -455,77 +449,93 @@ var bytePool = sync.Pool{
 }
 ```
 
-Critical path is allocation-free:
+The critical packet processing path is allocation-free:
 
-1. `pool.Get()` → borrow buffer
-2. Read into buffer offset (preserving header space)
-3. Build packet referencing buffer
-4. Encrypt in-place
-5. Send via channel
-6. `pool.Put()` after UDP write
+1. Acquire buffer from pool (`pool.Get`)
+2. Read data into buffer with reserved header space
+3. Build packet using the same buffer
+4. Perform in-place encryption
+5. Send over UDP via channel
+6. Return buffer to pool after transmission
+
+This design minimizes GC pressure and ensures consistent performance under load.
+
+---
 
 ### Buffer Sizing
 
 ```go
-const MaxPacketSize = 1500  // MTU-sized
+const MaxPacketSize = 1500 // MTU-sized
 ```
 
 - Header: 11 bytes
 - Payload: up to 1449 bytes
-- Encrypted overhead: 24 (nonce) + 16 (tag) = 40 bytes
-- Max ciphertext: ~1500 bytes
+- Encryption overhead: 40 bytes (24-byte nonce + 16-byte tag)
+- Maximum ciphertext fits within standard MTU
+
+---
 
 ### Channel Capacities
 
-| Component          | Capacity | Rationale                           |
-| ------------------ | -------- | ----------------------------------- |
-| Client Multiplexer | 2000     | Absorb burst from multiple sessions |
-| Server Multiplexer | 5000     | Higher concurrency expected         |
-| Session Signal     | 1        | Non-blocking notification           |
+| Component          | Capacity | Purpose                                  |
+| ------------------ | -------- | ---------------------------------------- |
+| Client Multiplexer | 2000     | Absorb burst traffic from many sessions  |
+| Server Multiplexer | 5000     | Handle higher concurrency on server side |
+| Session Signal     | 1        | Non-blocking flush notification          |
 
-### Benchmarks
+---
 
-#### Test Setup
+## Benchmark Results
+
+These `wrk` measurements come from a controlled local setup and do not represent packet-loss behavior of the current strict in-order/no-retransmission implementation.
+
+### Test Setup
 
 - Target: `http://example.com`
 - Duration: 30 seconds
-- Tool: wrk (same binary for fairness)
-- Proxy Mode: `proxychains → proxy-vpn (SOCKS5 over UDP)`
+- Tool: `wrk` (same binary for consistency)
+- Mode: `proxychains → proxy-vpn (SOCKS5 over UDP)`
 - Threads: 8
-- **Note**: Client and server were running on the same machine (no external VPS involved)
+- Note: Client and server were running on the same machine (no real network latency)
 
-#### Throughput Comparison
+---
 
-| Mode          | Concurrency | Requests/sec | Transfer/sec |
-| ------------- | ----------- | ------------ | ------------ |
-| **Direct**    | 100         | 662.92       | 545.10 KB/s  |
-| **UDP Proxy** | 100         | 552.17       | 454.03 KB/s  |
-| **Direct**    | 50          | 280.89       | 230.96 KB/s  |
-| **UDP Proxy** | 50          | 672.78       | 553.21 KB/s  |
+### Throughput Comparison
 
-#### Latency Comparison
+| Mode      | Concurrency | Requests/sec | Transfer/sec |
+| --------- | ----------- | ------------ | ------------ |
+| Direct    | 100         | 662.92       | 545.10 KB/s  |
+| UDP Proxy | 100         | 552.17       | 454.03 KB/s  |
+| Direct    | 50          | 280.89       | 230.96 KB/s  |
+| UDP Proxy | 50          | 672.78       | 553.21 KB/s  |
 
-##### Concurrency: 100
+---
 
-| Metric | Direct    | UDP Proxy     |
-| ------ | --------- | ------------- |
-| Avg    | 130.56 ms | **111.62 ms** |
-| P50    | 115.09 ms | **101.73 ms** |
-| P75    | 139.60 ms | **134.96 ms** |
-| P90    | 184.07 ms | **162.36 ms** |
-| P99    | 382.21 ms | **214.89 ms** |
+### Latency Comparison
 
-##### Concurrency: 50
+#### Concurrency: 100
 
-| Metric | Direct    | UDP Proxy    |
-| ------ | --------- | ------------ |
-| Avg    | 101.69 ms | **35.64 ms** |
-| P50    | 63.53 ms  | **30.72 ms** |
-| P75    | 93.45 ms  | **41.34 ms** |
-| P90    | 220.86 ms | **54.85 ms** |
-| P99    | 589.59 ms | **90.93 ms** |
+| Metric | Direct    | UDP Proxy |
+| ------ | --------- | --------- |
+| Avg    | 130.56 ms | 111.62 ms |
+| P50    | 115.09 ms | 101.73 ms |
+| P75    | 139.60 ms | 134.96 ms |
+| P90    | 184.07 ms | 162.36 ms |
+| P99    | 382.21 ms | 214.89 ms |
 
-#### Errors & Stability
+#### Concurrency: 50
+
+| Metric | Direct    | UDP Proxy |
+| ------ | --------- | --------- |
+| Avg    | 101.69 ms | 35.64 ms  |
+| P50    | 63.53 ms  | 30.72 ms  |
+| P75    | 93.45 ms  | 41.34 ms  |
+| P90    | 220.86 ms | 54.85 ms  |
+| P99    | 589.59 ms | 90.93 ms  |
+
+---
+
+### Errors and Stability
 
 | Mode      | Concurrency | Read Errors | Timeouts |
 | --------- | ----------- | ----------- | -------- |
@@ -534,93 +544,171 @@ const MaxPacketSize = 1500  // MTU-sized
 | Direct    | 50          | 0           | 87       |
 | UDP Proxy | 50          | 48          | 0        |
 
-#### Analysis
+---
 
-##### Throughput
+### Benchmark Analysis
 
-- At **high concurrency (100)**:
-  - Proxy achieves ~83% of direct throughput
-- At **moderate concurrency (50)**:
-  - Proxy outperforms direct path in this test scenario
+#### Throughput
 
-##### Latency
+- At high concurrency (100), the proxy achieves approximately 83% of direct throughput
+- At moderate concurrency (50), the proxy outperforms the direct path in this environment
 
-- Proxy shows **lower median and tail latency in this setup**
-- At 50 connections, latency improvement is **~2–3×**
-- Tail latency (P99) is significantly reduced
+#### Latency
 
-##### Key Observations
+- Lower median and tail latency observed through the proxy
+- At 50 concurrency, latency improves by 2–3×
+- Significant reduction in P99 latency
+
+#### Observations
 
 - UDP tunneling avoids TCP-over-TCP contention
 - Multiplexing reduces per-connection overhead
-- Internal buffering (channels, UDP batching, session window) introduces **traffic smoothing effects**
-- Direct `wrk` runs exhibit burst-induced instability (timeouts, high tail latency)
-- System favors **low latency over strict reliability**, leading to occasional packet loss under load
-
-#### Benchmark Notes & Caveats
-
-- Client and server were running on the **same machine**, so UDP transport does not experience real network conditions (latency, loss, jitter)
-- `proxychains` alters connection behavior and may reduce burst pressure compared to direct execution
-- Observed performance gains are largely due to:
-  - smoothing of request bursts
-  - reduced TCP head-of-line blocking effects
-  - different timeout/retry characteristics vs direct TCP
-
-> These results reflect local behavior and should not be directly generalized to real-world WAN deployments without further testing.
-
-#### Conclusion
-
-- **Minimal overhead at high load**
-- **Lower latency observed under moderate load in this environment**
-- **Improved tail latency due to smoother traffic patterns**
-- Trade-off: **minor packet loss under stress**
-
-This demonstrates that the design can act as a **low-latency, UDP-based multiplexed transport with implicit traffic shaping characteristics**, though real-world performance will depend on network conditions.
+- Channel buffering and batching smooth traffic bursts
+- Direct execution exhibits higher burst instability
+- These local figures do not model packet loss behavior of the current strict in-order build
 
 ---
 
-## Extensibility & Future Roadmap
+### Benchmark Caveats
 
-### Current Extension Points
+- Tests were performed locally; real-world WAN conditions are not reflected
+- No real packet loss, jitter, or latency variation was present
+- `proxychains` modifies connection behavior
+- Results are influenced by buffering and scheduling effects
 
-1. **Codec Interface**: Add `CodecMsgPack`, `CodecProto` implementations
+These results should not be directly generalized to real-world deployments.
 
-   ```go
-   type Codec interface {
-       Encode(h *header.Header, payload []byte) ([]byte, error)
-       Decode(b []byte) (*header.Header, []byte, error)
-   }
-   ```
+---
 
-2. **Crypto Interface**: Add `CryptoAES` implementation
+### Benchmark Conclusion
 
-   ```go
-   type Crypto interface {
-       Encrypt(dst, plaintext []byte) ([]byte, error)
-       Decrypt(ciphertext []byte) ([]byte, error)
-   }
-   ```
+- Minimal overhead under high load
+- Improved latency characteristics in this setup
+- Better tail latency due to traffic smoothing
+- Not representative of real packet-loss behavior in the current strict in-order/no-retransmission design
 
-3. **Token Bucket**: Pre-built rate limiting (disabled)
+---
 
-### Suggested Improvements
+## Real-World Performance Comparison
 
-| Area              | Improvement                            | Complexity |
-| ----------------- | -------------------------------------- | ---------- |
-| **Reliability**   | ARQ with selective ACKs                | High       |
-| **Security**      | ECDH key exchange at session start     | Medium     |
-| **Observability** | Prometheus metrics, structured logging | Low        |
-| **Performance**   | UDP batch I/O (`recvmmsg`)             | Medium     |
-| **NAT Traversal** | STUN/TURN integration                  | High       |
-| **Compression**   | LZ4 before encryption                  | Low        |
+To evaluate real network behavior under strict in-order delivery (without retransmission), Fast.com was used.
 
-### Planned but Unused
+### With Proxy (UDP Tunnel Enabled)
 
-The codebase contains stubs for:
+![With Proxy](./docs/with-proxy.png)
 
-- MsgPack codec (`internal/protocol/codec/msgpack.go`)
-- AES-GCM crypto (commented in `crypto.go`)
-- Session manager with rate limiting (commented in `server/main.go`)
+- Download Speed: ~6.4 Mbps
+- Latency (Loaded): ~350 ms
+
+Observations:
+
+- Consistent and correct page loads
+- No corrupted or partial responses
+- Occasional stalls under packet loss
+- Reduced throughput due to head-of-line blocking
+
+---
+
+### Without Proxy (Direct Connection)
+
+![Without Proxy](./docs/without-proxy.png)
+
+- Download Speed: ~18 Mbps
+- Latency (Loaded): ~309 ms
+
+---
+
+### Real-World Analysis
+
+The performance difference reflects the current design:
+
+- Strict in-order delivery is enforced
+- No retransmission layer exists
+- Missing packets block subsequent data
+
+This results in:
+
+- Reduced throughput under packet loss
+- Increased latency during stalled periods
+
+---
+
+### Trade-offs
+
+| Aspect               | Behavior           |
+| -------------------- | ------------------ |
+| Data correctness     | Guaranteed         |
+| Packet loss recovery | Not implemented    |
+| Throughput           | Reduced under loss |
+| Latency under load   | Increased          |
+
+---
+
+### Design Rationale
+
+The system intentionally avoids TCP-style retransmission mechanisms to prevent:
+
+- TCP-over-TCP inefficiencies
+- Complex congestion control interactions
+
+Instead, it focuses on:
+
+- Ordered delivery over UDP
+- Minimal protocol complexity
+- Clear separation between transport and reliability
+
+---
+
+### Summary
+
+The system demonstrates a UDP-based transport that preserves TCP correctness while avoiding full TCP complexity within the tunnel. This approach prioritizes correctness and simplicity, with the trade-off of reduced throughput under packet loss conditions.
+
+---
+
+## Extensibility and Future Roadmap
+
+### Extension Points
+
+1. Codec Interface
+
+```go
+type Codec interface {
+    Encode(h *header.Header, payload []byte) ([]byte, error)
+    Decode(b []byte) (*header.Header, []byte, error)
+}
+```
+
+2. Crypto Interface
+
+```go
+type Crypto interface {
+    Encrypt(dst, plaintext []byte) ([]byte, error)
+    Decrypt(ciphertext []byte) ([]byte, error)
+}
+```
+
+3. Token Bucket (pre-built, currently disabled)
+
+---
+
+### Future Improvements
+
+| Area          | Improvement                    | Complexity |
+| ------------- | ------------------------------ | ---------- |
+| Reliability   | Selective retransmission (ARQ) | High       |
+| Security      | ECDH key exchange              | Medium     |
+| Observability | Metrics and structured logging | Low        |
+| Performance   | UDP batch I/O (`recvmmsg`)     | Medium     |
+| NAT Traversal | STUN/TURN integration          | High       |
+| Compression   | LZ4 pre-encryption             | Low        |
+
+---
+
+### Planned but Unused Components
+
+- MsgPack codec implementation
+- AES-GCM crypto implementation (commented)
+- Session manager with rate limiting (commented)
 
 ---
 
@@ -642,6 +730,7 @@ CODEC=binary
 CRYPTO=chacha20
 KEY=<64-hex-chars>            # 32 bytes = 256-bit key
 CLIENT_ADDR=127.0.0.1:1080    # Client: SOCKS5 listen address
+IDLE_TIMEOUT_SECONDS=120      # Optional: idle timeout for client/server session reads
 ```
 
 Generate a key:
