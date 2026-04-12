@@ -41,7 +41,9 @@ func (m *Multiplexer) Start() {
 						log.Println("client multiplexer write error:", err)
 					}
 				}
-				pool.Put(work.OriginalBuffer)
+				if work.OriginalBuffer != nil {
+					pool.Put(work.OriginalBuffer)
+				}
 			case <-m.quit:
 				return
 			}

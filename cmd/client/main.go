@@ -57,7 +57,7 @@ func main() {
 	builder := protocol.NewBuilder()
 	parser := protocol.NewParser()
 
-	demux := client.NewDemultiplexer(udpConn.(*net.UDPConn), registry, parser)
+	demux := client.NewDemultiplexer(udpConn.(*net.UDPConn), registry, parser, mux)
 	demux.Start()
 	defer demux.Close()
 

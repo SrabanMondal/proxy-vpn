@@ -43,6 +43,10 @@ func HandleBrowserSession(
 
 	// 3. Create session context
 	sess := session.NewSession(browserConn)
+	sess.SetSessionID(sessID)
+	sess.SetNackSender(func(sessionID uint32, missing []uint32) {
+		sendNACKWithRetry(sessionID, missing, builder, multiplexer)
+	})
 	registry.Add(sessID, sess)
 	defer func() {
 		registry.Delete(sessID)
@@ -86,7 +90,8 @@ func HandleBrowserSession(
 		}
 
 		// Build DATA packet
-		pkt := protocol.NewPacket(sessID, header.TYPE_DATA, localSeqID, buf[header.HeaderSize:header.HeaderSize+n], buf)
+		seqID := localSeqID
+		pkt := protocol.NewPacket(sessID, header.TYPE_DATA, seqID, buf[header.HeaderSize:header.HeaderSize+n], buf)
 		localSeqID++
 		data, err := builder.Build(pkt)
 		if err != nil {
@@ -94,6 +99,7 @@ func HandleBrowserSession(
 			pool.Put(buf)
 			continue
 		}
+		sess.TrackSentPacket(seqID, data.Data)
 		if !sendOutboundWithTimeout(multiplexer, data, 2*time.Second) {
 			log.Printf("[session %d] send queue timeout, closing session", sessID)
 			sendFINWithRetry(sessID, builder, multiplexer)
@@ -130,4 +136,33 @@ func sendFINWithRetry(sessionID uint32, builder *protocol.Builder, multiplexer *
 	}
 
 	log.Printf("[session %d] failed to deliver FIN after retries", sessionID)
+}
+
+func sendNACKWithRetry(sessionID uint32, missing []uint32, builder *protocol.Builder, multiplexer *Multiplexer) {
+	if len(missing) == 0 {
+		return
+	}
+
+	payload := protocol.EncodeNACKPayload(missing)
+	for i := 0; i < 2; i++ {
+		buf := pool.Get()
+		copy(buf[header.HeaderSize:], payload)
+		nackPkt := protocol.NewPacket(
+			sessionID,
+			header.TYPE_NACK,
+			0,
+			buf[header.HeaderSize:header.HeaderSize+len(payload)],
+			buf,
+		)
+
+		data, err := builder.Build(nackPkt)
+		if err != nil {
+			pool.Put(buf)
+			continue
+		}
+
+		if sendOutboundWithTimeout(multiplexer, data, 200*time.Millisecond) {
+			return
+		}
+	}
 }

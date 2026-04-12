@@ -11,6 +11,7 @@ const (
 	TYPE_FIN     uint8 = 3
 	TYPE_PING    uint8 = 4
 	TYPE_PONG    uint8 = 5
+	TYPE_NACK    uint8 = 6
 )
 
 // Header represents the fixed header in every packet.

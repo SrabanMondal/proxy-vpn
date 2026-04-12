@@ -106,6 +106,10 @@ func (d *Demultiplexer) handlePacket(buf []byte, n int, clientAddr *net.UDPAddr)
 		if !ok {
 			// Register pending session before dialing so early DATA is buffered, not dropped.
 			sess = session.NewPendingServerSession(clientAddr)
+			sess.SetSessionID(pkt.Header.SessionID)
+			sess.SetNackSender(func(sessionID uint32, missing []uint32) {
+				d.sendNACKWithRetry(sessionID, clientAddr, missing)
+			})
 			d.Registry.Add(pkt.Header.SessionID, sess)
 			if queued, found := d.earlyData[pkt.Header.SessionID]; found {
 				for _, item := range queued {
@@ -141,6 +145,23 @@ func (d *Demultiplexer) handlePacket(buf []byte, n int, clientAddr *net.UDPAddr)
 			delete(d.earlyData, pkt.Header.SessionID)
 		}
 		pool.Put(buf)
+
+	case header.TYPE_NACK:
+		pool.Put(buf)
+		if !ok {
+			return
+		}
+
+		missing := protocol.DecodeNACKPayload(pkt.Payload)
+		for _, seqID := range missing {
+			packet, found := sess.GetSentPacket(seqID)
+			if !found {
+				continue
+			}
+			if !d.Multiplexer.Send(OutboundPacket{Data: packet, Addr: sess.ClientAddr}, 500*time.Millisecond) {
+				log.Printf("[session %d] retransmit enqueue timeout for seq=%d", pkt.Header.SessionID, seqID)
+			}
+		}
 
 	default:
 		pool.Put(buf)
@@ -213,6 +234,7 @@ func (d *Demultiplexer) runTCPRelay(sess *session.SessionContext, sessionID uint
 			pool.Put(buf)
 			continue
 		}
+		sess.TrackSentPacket(seqID, work.Data)
 
 		if !d.Multiplexer.Send(OutboundPacket{
 			Data:   work.Data,
@@ -254,4 +276,39 @@ func (d *Demultiplexer) sendFINWithRetry(sessionID uint32, addr *net.UDPAddr, se
 	}
 
 	log.Printf("[session %d] failed to deliver FIN after retries", sessionID)
+}
+
+func (d *Demultiplexer) sendNACKWithRetry(sessionID uint32, addr *net.UDPAddr, missing []uint32) {
+	if addr == nil || len(missing) == 0 {
+		return
+	}
+
+	payload := protocol.EncodeNACKPayload(missing)
+	for i := 0; i < 2; i++ {
+		buf := pool.Get()
+		copy(buf[header.HeaderSize:], payload)
+		nackPkt := protocol.NewPacket(
+			sessionID,
+			header.TYPE_NACK,
+			0,
+			buf[header.HeaderSize:header.HeaderSize+len(payload)],
+			buf,
+		)
+
+		work, err := d.Builder.Build(nackPkt)
+		if err != nil {
+			pool.Put(buf)
+			continue
+		}
+
+		if d.Multiplexer.Send(OutboundPacket{
+			Data:   work.Data,
+			Addr:   addr,
+			Buffer: work.OriginalBuffer,
+		}, 200*time.Millisecond) {
+			return
+		}
+
+		pool.Put(work.OriginalBuffer)
+	}
 }
